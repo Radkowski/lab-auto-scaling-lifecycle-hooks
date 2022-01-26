@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+
+  MasterVPC:
+    Description: Select existing VPC from the list below
+    Type: 'AWS::EC2::VPC::Id'
+    ConstraintDescription: 'Must be valid VPC'
+
+
+  KeyPairName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair.
+
+
+  SubnetsASG:
+    Description: Subnets where ASG will be deployed
+    Type: 'AWS::EC2::Subnet::Id'
+    ConstraintDescription: Must be a part of VPC selected above.
+
+
+  StaticIP:
+    Description: Static IP to be assigned as secondary
+    Type: String
+    ConstraintDescription: Must be a part of selected subnet
+
+
+  SecGroup3128:
+    Description: 'Security Groups for Squid (tcp/3128)'
+    Type: String
+    Default: 172.16.0.0/12
+    ConstraintDescription: "SecurityGroup which controls access to Squid tcp/3128 port"
+
+  SecGroup22:
+    Description: 'Security Groups for Squid (tcp/22)'
+    Type: String
+    Default: 0.0.0.0/0
+    ConstraintDescription: "SecurityGroup which controls access to Squid tcp/22 port"
+
+
+  SquidInsType:
+    Default: t4g.micro
+    Type: String
+    AllowedValues:
+    - t4g.micro
+    - t4g.small
+    - t4g.medium
+
+
+  LatestAmiIdGraviton:
+    Description: You need to be brave enough to modify this parameter
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-arm64-gp2'
+
+
+
+
+Resources:
+
+
+
+  SquidSecurityGroup:
+      Properties:
+        GroupDescription: Squid-servers-security-group
+        GroupName: Squid-servers-security-group
+        SecurityGroupIngress:
+         -
+          CidrIp: !Ref SecGroup3128
+          Description: IsolatedNets
+          IpProtocol: 'tcp'
+          FromPort: 3128
+          ToPort: 3128
+         -
+          CidrIp: !Ref SecGroup22
+          Description: ARM
+          IpProtocol: 'tcp'
+          FromPort: 22
+          ToPort: 22
+
+        VpcId: !Ref MasterVPC
+      Type: "AWS::EC2::SecurityGroup"
+
+  Squidtemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn: LambdaFunction
+    Properties:
+        LaunchTemplateName: Squid-template-202201
+        LaunchTemplateData:
+            UserData: "IyEvYmluL2Jhc2gKeXVtIC15IHVwZGF0ZQo="
+            ImageId: !Ref LatestAmiIdGraviton
+            InstanceType: !Ref SquidInsType
+            KeyName: !Ref KeyPairName
+            SecurityGroupIds:
+              - !Ref SquidSecurityGroup
+            TagSpecifications:
+               - ResourceType: instance
+                 Tags:
+                 - Key: Name
+                   Value: Squid-server
+
+
+
+
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: Squid-ASG
+      DesiredCapacity: '1'
+      HealthCheckType: EC2
+      LaunchTemplate:
+          LaunchTemplateId: !Ref Squidtemplate
+          Version: '1'
+      MaxSize: '1'
+      MinSize: '1'
+      VPCZoneIdentifier:
+        - !Ref SubnetsASG
+
+
+  LambdaRole:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        RoleName: Lambda-asg-hook-role
+        AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Path: /
+        Policies:
+          - PolicyName: Lambda-asg-hook-policy
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - 'ec2:DescribeInstances'
+                    - 'ec2:AssignPrivateIpAddresses'
+                    - 'autoscaling:CompleteLifecycleAction'
+                  Resource: '*'
+                - Effect: Allow
+                  Action:
+                    - 'logs:CreateLogStream'
+                    - 'logs:PutLogEvents'
+                  Resource: !Join
+                    - ''
+                    - - 'arn:aws:logs:'
+                      - !Ref 'AWS::Region'
+                      - ':'
+                      - !Ref 'AWS::AccountId'
+                      - ':log-group:/aws/lambda/Lambda-asg-hook-function:*'
+                - Effect: Allow
+                  Action:
+                    - 'logs:CreateLogGroup'
+                  Resource: !Join
+                    - ''
+                    - - 'arn:aws:logs:'
+                      - !Ref 'AWS::Region'
+                      - ':'
+                      - !Ref 'AWS::AccountId'
+                      - ':*'
+
+
+  LambdaFunction:
+      Type: 'AWS::Lambda::Function'
+      Properties:
+        FunctionName: Lambda-asg-hook-function
+        Handler: index.lambda_handler
+        Role: !GetAtt LambdaRole.Arn
+        Code:
+          ZipFile: |
+              import json
+              import boto3
+              import os
+
+              secondary_ip = os.environ['SEC_IP_ADDR']
+
+
+              def get_interface_id(instance_id):
+                  client_ec2 = boto3.client('ec2')
+                  response = client_ec2.describe_instances(InstanceIds=[instance_id])
+                  return (response['Reservations'][0]['Instances'][0]['NetworkInterfaces'][0]['NetworkInterfaceId'])
+
+
+              def add_secondary_ip(interface_id,sec_ip_addr):
+                  client_ec2 = boto3.client('ec2')
+                  response = client_ec2.assign_private_ip_addresses(
+                      AllowReassignment=True,
+                      NetworkInterfaceId=interface_id,
+                      PrivateIpAddresses=[sec_ip_addr]
+                  )
+
+
+              def complete_hook(hook_name, asg_name, asg_token):
+                  client_asg = boto3.client('autoscaling')
+                  response = client_asg.complete_lifecycle_action(
+                      LifecycleHookName=hook_name,
+                      AutoScalingGroupName=asg_name,
+                      LifecycleActionToken=asg_token,
+                      LifecycleActionResult='CONTINUE'
+                  )
+
+
+              def lambda_handler(event, context):
+                  add_secondary_ip(get_interface_id(event['detail']['EC2InstanceId']),secondary_ip)
+                  complete_hook(event['detail']['LifecycleHookName'],event['detail']['AutoScalingGroupName'],event['detail']['LifecycleActionToken'])
+                  return 0
+        Runtime: python3.8
+        Environment:
+            Variables:
+                SEC_IP_ADDR: !Ref StaticIP
+        Timeout: 30
+        ReservedConcurrentExecutions: 100
+
+
+  HookTriggerRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ASG-hook-trigger-rule
+        Description: "Delete detected rule - default bus"
+        EventPattern:
+          source:
+            - "aws.autoscaling"
+          detail-type:
+            - "EC2 Instance-launch Lifecycle Action"
+        State: "ENABLED"
+        Targets:
+          - Arn: !GetAtt
+              - LambdaFunction
+              - Arn
+            Id: "v1"
+
+
+  HookTriggerRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn:
+        Fn::GetAtt:
+          - "HookTriggerRule"
+          - "Arn"
+
+
+  Hookdefinition:
+      Type: AWS::AutoScaling::LifecycleHook
+      Properties:
+        AutoScalingGroupName: !Ref ASG
+        LifecycleHookName: 'asg-hook-secondary-ip'
+        LifecycleTransition: 'autoscaling:EC2_INSTANCE_LAUNCHING'
+        HeartbeatTimeout: 60
