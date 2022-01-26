@@ -1,0 +1,1 @@
+# lab-auto-scaling-lifecycle-hooks
